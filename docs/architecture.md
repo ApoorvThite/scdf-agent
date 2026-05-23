@@ -102,6 +102,77 @@ Estimated monthly cost at 100 crew runs/day: **$8–15 total** (dominated by deb
 
 ---
 
+---
+
+## Agent Output Contracts
+
+Every agent returns a Pydantic model from `src/models/outputs.py`. No agent returns a plain string.
+
+| Agent | Output Model | Key Fields |
+|---|---|---|
+| Signal Ingester | `SignalAnalysis` | `severity_score`, `severity_label`, `requires_full_crew`, `affected_kpis` |
+| Scenario Builder | `ScenarioSet` | `p10`, `p50`, `p90` (each a `Scenario`), `forecast_confidence` |
+| Impact Modeler | `ImpactAnalysis` | `precedents` (list of `HistoricalPrecedent`), `kpi_impacts`, `retrieval_quality` |
+| Bull Analyst | `AnalystPosition` | `position="bull"`, `thesis`, `key_evidence`, `recommended_scenario` |
+| Bear Analyst | `AnalystPosition` | `position="bear"`, `thesis`, `key_evidence`, `dissenting_risk` |
+| Playbook Writer | `Playbook` | `actions` (list of `PlaybookAction`), `dominant_scenario`, `ragas_context` |
+
+`PlaybookAction` fields: `priority`, `action`, `rationale`, `timeframe`, `cited_precedent_id`.
+
+All models live in `src/models/outputs.py`. The `__init__.py` re-exports all of them.
+
+---
+
+## Flow Execution Paths
+
+The `DisruptionFlow` (in `src/flows/disruption_flow.py`) uses a `@router` to branch on severity:
+
+```
+ingest_signal → build_scenarios → model_impact
+                                       │
+                          ┌────────────┴────────────┐
+                     severity < 4              severity ≥ 4
+                     (fast_path)               (full_debate)
+                          │                        │
+                    fast_playbook          run_debate (bull ∥ bear)
+                          │                        │
+                          └──────────┬─────────────┘
+                                persist_result
+                                (→ Playbook)
+```
+
+**Fast path** (severity < 4): skips the gpt-4o debate crew entirely.
+Runs 4 agents: signal ingester → scenario builder → impact modeler → playbook writer.
+
+**Full debate** (severity ≥ 4): runs all 6 agents.
+Bull and bear analysts run **in parallel** via `asyncio.gather` + `asyncio.to_thread`.
+
+The `@router` returns the string `"fast_path"` or `"full_debate"`. Downstream `@listen` methods
+use these strings as triggers. The final `persist_result` step listens to both terminal branches
+using stacked `@listen` decorators.
+
+---
+
+## Langfuse Trace Structure
+
+Every crew run produces one top-level Langfuse trace with 4–6 child agent spans:
+
+```
+Trace: crew-run-{signal_id}   ← created by create_run_trace(signal_id)
+  ├── Span: signal_ingester    ← @trace_agent("signal_ingester")
+  ├── Span: scenario_builder   ← @trace_agent("scenario_builder")
+  ├── Span: impact_modeler     ← @trace_agent("impact_modeler")
+  ├── Span: bull_analyst       ← only on full-debate path
+  ├── Span: bear_analyst       ← only on full-debate path
+  └── Span: playbook_writer    ← @trace_agent("playbook_writer")
+```
+
+Trace context is propagated via a `ContextVar` (`_trace_context` in `src/observability/langfuse_tracer.py`).
+`create_run_trace(signal_id)` sets the context at the start of `ingest_signal`.
+Each `@trace_agent` decorated function reads the context and creates a child span automatically.
+
+---
+
 ## How to Run Locally
 
 ```bash
