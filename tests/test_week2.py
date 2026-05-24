@@ -317,7 +317,9 @@ class TestStubAgents:
         from src.agents.impact_modeler import run
         result = run(sample_signal)
         assert len(result.precedents) == 3
-        assert all(0 < p.similarity_score <= 1.0 for p in result.precedents)
+        # Week 3: real Qdrant impl falls back to stub (similarity_score=0.0) when
+        # services are unavailable in CI — validate structure only.
+        assert all(0.0 <= p.similarity_score <= 1.0 for p in result.precedents)
 
     @patch("src.observability.langfuse_tracer.get_tracer")
     def test_bull_analyst_returns_bull_position(self, mock_get_tracer, sample_signal):

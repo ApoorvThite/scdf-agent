@@ -32,6 +32,7 @@ from src.models.outputs import (
     ScenarioSet,
     SignalAnalysis,
 )
+from src.evaluation.ragas_scorer import RAGASScore
 from src.observability.langfuse_tracer import create_run_trace, get_tracer
 from src.signals.mock_generator import DisruptionSignal
 
@@ -47,6 +48,7 @@ class FlowState(BaseModel):
     bull_position: Optional[AnalystPosition] = None
     bear_position: Optional[AnalystPosition] = None
     playbook: Optional[Playbook] = None
+    ragas_score: Optional[RAGASScore] = None
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     started_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -134,7 +136,22 @@ class DisruptionFlow(Flow[FlowState]):
         if risk in ("high", "critical"):
             print(f"[notify] SNS alert would fire for {risk} risk playbook")
 
-        # Flush Langfuse so all agent spans are recorded
+        # RAGAS evaluation — wrap in try/except so flow always completes
+        try:
+            from src.evaluation.ragas_scorer import evaluate_playbook
+            ragas_score = evaluate_playbook(playbook, self.state.signal)
+            self.state.ragas_score = ragas_score
+            print(
+                f"[ragas] overall={ragas_score.overall:.3f} "
+                f"faithfulness={ragas_score.faithfulness:.3f} "
+                f"relevance={ragas_score.answer_relevance:.3f} "
+                f"precision={ragas_score.context_precision:.3f} "
+                f"passed={'✓' if ragas_score.passed else '✗'}"
+            )
+        except Exception as exc:
+            print(f"[ragas] evaluation skipped: {exc}")
+
+        # Flush Langfuse so all agent spans and RAGAS scores are recorded
         try:
             get_tracer().flush()
         except Exception:

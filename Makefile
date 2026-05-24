@@ -1,4 +1,4 @@
-.PHONY: install up down setup seed test signal week1 run-crew run-crew-port verify-langfuse week2
+.PHONY: install up down setup seed test signal week1 run-crew run-crew-port verify-langfuse week2 forecast-test retrieval-test evaluate week3
 
 install:
 	pip install -r requirements.txt
@@ -42,4 +42,22 @@ week2: up
 	@sleep 15
 	$(MAKE) run-crew
 	$(MAKE) verify-langfuse
+	$(MAKE) test
+
+forecast-test:
+	python -m src.forecasting.prophet_engine
+
+retrieval-test:
+	python -m src.memory.qdrant_retrieval
+
+evaluate:
+	python -m scripts.evaluate_playbook
+
+week3: up
+	@echo "Waiting 15 seconds for services to start..."
+	@sleep 15
+	$(MAKE) seed
+	$(MAKE) run-crew
+	$(MAKE) verify-langfuse
+	$(MAKE) evaluate
 	$(MAKE) test

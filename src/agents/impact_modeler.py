@@ -1,17 +1,15 @@
 """
-Impact Modeler agent — retrieves similar historical disruptions and estimates KPI impact.
+Impact Modeler agent — retrieves similar historical disruptions via Qdrant RAG
+and synthesises KPI impact estimates.
 
-Week 2: returns 3 hardcoded HistoricalPrecedent objects with real-looking record IDs.
-# TODO WEEK 4: Replace stub with real Qdrant semantic search.
-#              Wire in: get_embedding(signal.description) → qdrant.search(
-#                  collection_name="disruptions", query_vector=embedding, limit=3
-#              ) → parse ScoredPoint payloads into HistoricalPrecedent objects.
+# IMPLEMENTED WEEK 3: Real Qdrant semantic search with metadata filtering.
+#                     Falls back to hardcoded stub if Qdrant is unavailable.
 """
 
 from crewai import Agent, Task
 
 from src.config.llm_config import get_primary_llm
-from src.models.outputs import HistoricalPrecedent, ImpactAnalysis
+from src.models.outputs import HistoricalPrecedent, ImpactAnalysis, Scenario, SignalAnalysis
 from src.observability.langfuse_tracer import trace_agent
 from src.signals.mock_generator import DisruptionSignal
 
@@ -43,23 +41,121 @@ task = Task(
 )
 
 
-@trace_agent("impact_modeler")
-def run(signal: DisruptionSignal) -> ImpactAnalysis:
-    """
-    Retrieve historical precedents and estimate KPI impacts for the signal.
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
-    Week 2 stub — returns 3 hardcoded precedents with realistic record IDs.
-    The real week-4 implementation will query Qdrant with semantic search.
+def _build_kpi_impact_map(scenario: Scenario, signal: DisruptionSignal) -> dict[str, str]:
+    """Build human-readable KPI impact strings from the P50 scenario."""
+    lead_dir = "+" if scenario.lead_time_impact_days >= 0 else ""
+    inv_dir = "+" if scenario.inventory_impact_pct >= 0 else ""
+    svc_dir = "+" if scenario.service_level_impact_pct >= 0 else ""
+    return {
+        "lead_time": (
+            f"{lead_dir}{scenario.lead_time_impact_days} days expected "
+            f"(P50 base-case, {signal.disruption_type} in {signal.region})"
+        ),
+        "inventory": (
+            f"{inv_dir}{scenario.inventory_impact_pct:.1f}% units "
+            f"(P50 base-case)"
+        ),
+        "service_level": (
+            f"{svc_dir}{scenario.service_level_impact_pct:.1f}% "
+            f"service level change (P50 base-case)"
+        ),
+        "freight_cost": f"Spot rate premium expected on alternative routes",
+        "cash_flow": f"Increased working capital requirement likely",
+    }
+
+
+def _severity_to_risk(severity: int) -> str:
+    """Map numeric severity to a risk label."""
+    if severity <= 3:
+        return "low"
+    elif severity <= 6:
+        return "medium"
+    elif severity <= 8:
+        return "high"
+    return "critical"
+
+
+# ---------------------------------------------------------------------------
+# Agent run function
+# ---------------------------------------------------------------------------
+
+@trace_agent("impact_modeler")
+def run(signal: DisruptionSignal, scenario: Scenario | None = None) -> ImpactAnalysis:
     """
-    precedents = [
+    Retrieve historical precedents via Qdrant semantic search and estimate KPI impacts.
+
+    Falls back to hardcoded stub data if Qdrant is unavailable.
+    Stub data is clearly labelled in the retrieval_quality score (0.0).
+
+    Args:
+        signal:   The DisruptionSignal to retrieve precedents for.
+        scenario: The P50 Scenario from the ScenarioSet (for KPI impact map).
+                  If None, uses generic impact descriptions.
+    """
+    from src.memory.qdrant_retrieval import (
+        retrieve_similar_disruptions,
+        retrieve_response_records,
+        format_precedents,
+        get_retrieval_quality_score,
+    )
+
+    try:
+        disruption_records = retrieve_similar_disruptions(
+            disruption_type=signal.disruption_type,
+            region=signal.region,
+            description=signal.description,
+            severity_score=signal.severity_score,
+            top_k=3,
+        )
+
+        if not disruption_records:
+            raise ValueError("No records returned from Qdrant — falling back to stub")
+
+        disruption_ids = [r.get("disruption_id", r.get("id", "")) for r in disruption_records]
+        response_records = retrieve_response_records(disruption_ids)
+        precedents = format_precedents(disruption_records, response_records)
+
+    except Exception as exc:
+        import logging
+        logging.warning(f"Qdrant retrieval failed, using stub precedents: {exc}")
+        precedents = _stub_precedents()
+
+    # Build KPI impact map from P50 scenario if available
+    if scenario is not None:
+        kpi_impacts = _build_kpi_impact_map(scenario, signal)
+    else:
+        kpi_impacts = {
+            "lead_time": f"Expected +14 to +42 days depending on resolution speed",
+            "inventory": "Buffer stock depletion likely; reorder triggers probable",
+            "service_level": "Risk of SLA breach within 3 weeks",
+            "freight_cost": "Spot rate premium of 40-120% on alternative routes",
+            "cash_flow": "Increased working capital requirement estimated",
+        }
+
+    return ImpactAnalysis(
+        signal_id=signal.signal_id,
+        precedents=precedents,
+        kpi_impacts=kpi_impacts,
+        risk_level=_severity_to_risk(signal.severity_score),
+        retrieval_quality=get_retrieval_quality_score(precedents),
+    )
+
+
+def _stub_precedents() -> list[HistoricalPrecedent]:
+    """Hardcoded fallback precedents when Qdrant is unavailable."""
+    return [
         HistoricalPrecedent(
             record_id="a3f8c2d1-7e45-4b2a-9c8f-1d3e5f7a9b0c",
-            similarity_score=0.91,
+            similarity_score=0.0,
             disruption_type="port",
             region="Asia-Pacific",
             description=(
-                "Port of Kaohsiung crane operator strike — 35% capacity reduction "
-                "for 3 weeks. Significant rerouting to Port of Busan."
+                "Stub fallback: Port of Kaohsiung crane operator strike — "
+                "35% capacity reduction for 3 weeks."
             ),
             resolution_days=21,
             actions_taken=[
@@ -71,12 +167,11 @@ def run(signal: DisruptionSignal) -> ImpactAnalysis:
         ),
         HistoricalPrecedent(
             record_id="b7d4e9f2-3a1c-4d8e-b5f2-2c4a6b8d0e1f",
-            similarity_score=0.84,
+            similarity_score=0.0,
             disruption_type="port",
             region="Asia-Pacific",
             description=(
-                "Typhoon Haikui forces Port of Taipei closure for 11 days. "
-                "200+ vessels rerouted to regional alternatives."
+                "Stub fallback: Typhoon Haikui forces Port of Taipei closure for 11 days."
             ),
             resolution_days=14,
             actions_taken=[
@@ -88,12 +183,11 @@ def run(signal: DisruptionSignal) -> ImpactAnalysis:
         ),
         HistoricalPrecedent(
             record_id="c1e6a4b8-9f2d-4c7a-e3b1-3d5c7e9f1a2b",
-            similarity_score=0.77,
+            similarity_score=0.0,
             disruption_type="port",
             region="Asia-Pacific",
             description=(
-                "Port of Shanghai COVID-19 lockdown reduces throughput by 45% "
-                "for 6 weeks. Severe container equipment imbalance."
+                "Stub fallback: Port of Shanghai COVID-19 lockdown reduces throughput by 45%."
             ),
             resolution_days=42,
             actions_taken=[
@@ -104,19 +198,3 @@ def run(signal: DisruptionSignal) -> ImpactAnalysis:
             outcome="partial",
         ),
     ]
-
-    avg_similarity = sum(p.similarity_score for p in precedents) / len(precedents)
-
-    return ImpactAnalysis(
-        signal_id=signal.signal_id,
-        precedents=precedents,
-        kpi_impacts={
-            "lead_time": "Expected +14 to +42 days depending on resolution speed",
-            "inventory": "Buffer stock depletion rate 2-3× normal; reorder triggers likely",
-            "service_level": "Risk of dropping below 85% SLA within 3 weeks",
-            "freight_cost": "Spot rate premium of 40-120% expected on alternative routes",
-            "cash_flow": "Increased working capital requirement of $2-8M estimated",
-        },
-        risk_level="high",
-        retrieval_quality=round(avg_similarity, 3),
-    )

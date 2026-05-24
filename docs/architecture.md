@@ -89,18 +89,89 @@ Estimated monthly cost at 100 crew runs/day: **$8–15 total** (dominated by deb
 
 ## 8-Phase Build Plan
 
-| Week | Milestone |
-|---|---|
-| 1 | Project scaffold, Qdrant + Langfuse setup, Helicone proxy, mock signals, 60 seed records |
-| 2 | Stub CrewAI Flow + all 6 stub agents, Langfuse trace per agent step, Qdrant retrieval wired |
-| 3 | Signal Ingester agent fully functional, Redis Streams consumer, DynamoDB persistence |
-| 4 | Scenario Builder + Prophet P10/P50/P90 forecasting integrated |
-| 5 | Impact Modeler with full Qdrant RAG retrieval pipeline |
-| 6 | Bull/Bear debate crew with structured argument schema + synthesis |
-| 7 | Playbook Writer + S3 storage + SNS alerts + AWS Lambda scheduling |
-| 8 | React dashboard (Recharts) + Vercel deployment + end-to-end integration test |
+| Week | Milestone | Status |
+|---|---|---|
+| 1 | Project scaffold, Qdrant + Langfuse setup, Helicone proxy, mock signals, 60 seed records | ✅ Complete |
+| 2 | Stub CrewAI Flow + all 6 stub agents, Langfuse trace per agent step, fast-path/full-debate routing | ✅ Complete |
+| 3 | Prophet P10/P50/P90 forecasting (scenario_builder), Qdrant RAG retrieval (impact_modeler), RAGAS evaluation layer | ✅ Complete |
+| 4 | Signal Ingester real LLM, Redis Streams consumer, DynamoDB persistence layer | ⬜ Upcoming |
+| 5 | Bull/Bear debate crew with structured argument schema + synthesis | ⬜ Upcoming |
+| 6 | Playbook Writer real LLM + S3 artifact storage | ⬜ Upcoming |
+| 7 | SNS alerts + AWS Lambda scheduling + end-to-end integration test | ⬜ Upcoming |
+| 8 | React dashboard (Recharts) + Vercel deployment | ⬜ Upcoming |
 
 ---
+
+---
+
+## Forecasting Layer (Week 3)
+
+`src/forecasting/prophet_engine.py` replaces the stub scenario builder with real probabilistic forecasting.
+
+### Synthetic Series Approach
+
+Because we don't have live sensor feeds, the engine generates 365 days of synthetic daily KPI data by:
+
+1. Starting from regional baseline values (e.g. AP baseline lead_time = 21 days)
+2. Applying a disruption-type-specific perturbation pattern (step change + decay curve)
+3. Scaling by `_severity_multiplier(severity)` → 1.0× at severity 1, 3.0× at severity 10
+4. Adding Gaussian noise for realistic variation
+
+Prophet then fits this series and returns `yhat_lower` (P10 bound) and `yhat_upper` (P90 bound) over a 30-day forecast horizon.
+
+### P10/P50/P90 Derivation
+
+**Lead time** (higher = worse):
+- P10 (worst case): uses `yhat_upper.max()` → longest predicted lead time
+- P50 (expected): uses `yhat.mean()` → central forecast
+- P90 (best case): uses `yhat_lower.min()` → fastest predicted resolution
+
+**Inventory level / service level** (lower = worse):
+- P10 (worst case): uses `yhat_lower.min()` → deepest predicted drop
+- P50 (expected): uses `yhat.mean()` → central forecast
+- P90 (best case): uses `yhat_upper.max()` → best predicted outcome
+
+Resolution window (P10/P50/P90 days) is derived from severity band (≤3 → 14/7/3, ≤6 → 35/14/7, ≤8 → 56/21/10, 10 → 90/35/14).
+
+If Prophet fitting fails (e.g. timezone-aware timestamps from pandas), the engine falls back to linear interpolation from the same perturbation deltas.
+
+---
+
+## RAG Retrieval Strategy (Week 3)
+
+`src/memory/qdrant_retrieval.py` implements a three-tier broadening search strategy:
+
+1. **Attempt 1** — type-exact + region-exact + resolved=True filter
+2. **Attempt 2** (< 2 results) — type-exact + resolved=True only (any region)
+3. **Attempt 3** (still empty) — unfiltered vector search (any type/region)
+
+Embeddings use `text-embedding-ada-002` via the Helicone proxy. The query string is constructed from disruption_type, region, severity_score, and affected_kpis to maximise semantic recall.
+
+`retrieve_response_records()` fetches response records via Qdrant `scroll` with a `disruption_id` FK filter. `format_precedents()` zips disruption records with their corresponding response records and converts to `HistoricalPrecedent` Pydantic models.
+
+If embedding or Qdrant connection fails, `retrieve_similar_disruptions()` returns an empty list (graceful degradation). `impact_modeler.run()` then falls back to three hardcoded stub precedents (similarity_score=0.0) so the flow always completes.
+
+---
+
+## RAGAS Evaluation Layer (Week 3)
+
+`src/evaluation/ragas_scorer.py` implements three RAG quality metrics using gpt-4o-mini as judge — without the heavy `ragas` pip dependency.
+
+| Metric | What it measures | Weight |
+|---|---|---|
+| Faithfulness | Are playbook actions grounded in the retrieved precedents? | 40% |
+| Answer Relevance | Does the playbook address the signal's disruption type and region? | 30% |
+| Context Precision | Are the retrieved precedents relevant to the query? | 30% |
+
+**Threshold**: `overall >= 0.65` → `passed = True`
+
+**Formula**: `overall = 0.4 × faithfulness + 0.3 × answer_relevance + 0.3 × context_precision`
+
+Each metric calls `_call_llm()` which sends a zero-shot JSON prompt to gpt-4o-mini and parses `{"score": float, "reasoning": str}`. Scores default to 0.5 on parse failure so evaluation never blocks the flow.
+
+The flow's `persist_result` step calls `evaluate_playbook()` inside a `try/except` so RAGAS failure never stops a flow run. Results are logged to Langfuse via `score_current_trace`.
+
+The standalone `scripts/evaluate_playbook.py` runner mocks Langfuse and tests 3 signal types (port/8, weather/6, tariff/5), saving JSON results to `data/eval_results/`.
 
 ---
 
