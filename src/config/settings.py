@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     dynamodb_table_disruptions: str = Field(
         "scdf-disruptions", validation_alias="DYNAMODB_TABLE_DISRUPTIONS"
     )
+    dynamodb_endpoint_url: str | None = Field(
+        None, validation_alias="DYNAMODB_ENDPOINT_URL"
+    )
     s3_bucket_playbooks: str = Field(
         "scdf-playbooks", validation_alias="S3_BUCKET_PLAYBOOKS"
     )

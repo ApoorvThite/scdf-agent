@@ -9,12 +9,21 @@ Execution paths:
   FAST PATH    (severity < 4):
     ingest_signal → build_scenarios → model_impact
     → fast_playbook → persist_result
+
+persist_result saves to DynamoDB and publishes SNS alerts in addition to RAGAS
+evaluation. All I/O is wrapped in try/except — infra failures never crash the crew.
 """
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag: ensures ensure_table_exists() runs only once per process
+_startup_done = False
 
 from crewai.flow.flow import Flow, listen, router, start, or_
 from pydantic import BaseModel, Field
@@ -38,6 +47,26 @@ from src.signals.mock_generator import DisruptionSignal
 
 _FAST_PATH = "fast_path"
 _FULL_DEBATE = "full_debate"
+
+
+def startup_check() -> None:
+    """
+    One-time startup routine: ensure DynamoDB table exists.
+
+    Guarded by _startup_done flag so it runs at most once per process,
+    at the beginning of the first ingest_signal call.
+    Logs success/failure but never raises — infra issues must not block signal processing.
+    """
+    global _startup_done
+    if _startup_done:
+        return
+    _startup_done = True
+    try:
+        from src.persistence.dynamodb import ensure_table_exists
+        ensure_table_exists()
+        logger.info("[startup] DynamoDB table ready")
+    except Exception as exc:
+        logger.warning(f"[startup] DynamoDB setup failed (continuing): {exc}")
 
 
 class FlowState(BaseModel):
@@ -69,6 +98,7 @@ class DisruptionFlow(Flow[FlowState]):
     def ingest_signal(self):
         """Classify the raw signal and determine routing."""
         assert self.state.signal is not None, "signal must be set before kickoff"
+        startup_check()
         create_run_trace(signal_id=self.state.signal.signal_id)
 
         analysis = run_signal_ingester(self.state.signal)
@@ -120,28 +150,24 @@ class DisruptionFlow(Flow[FlowState]):
     @listen(fast_playbook)
     def persist_result(self):
         """
-        Persist the playbook and emit notifications.
+        Final step: evaluate quality, persist to DynamoDB, and notify planners.
 
-        Stub: prints to stdout.
-        TODO WEEK 7: write to DynamoDB + S3, publish SNS notification.
+        All I/O is wrapped in try/except — infra failures never crash the crew.
+        Execution order:
+          1. RAGAS quality evaluation (gpt-4o-mini judge)
+          2. DynamoDB upsert (full FlowState serialisation)
+          3. SNS alert routing (risk-based topic selection)
+          4. Langfuse flush (ensures all spans are recorded)
         """
         playbook = self.state.playbook
         assert playbook is not None
 
-        risk = playbook.overall_risk
-        run_id = self.state.run_id
-
-        # Stub persistence — real DynamoDB/SNS wiring in Week 7
-        print(f"[persist] run_id={run_id}  signal={playbook.signal_id}  risk={risk}")
-        if risk in ("high", "critical"):
-            print(f"[notify] SNS alert would fire for {risk} risk playbook")
-
-        # RAGAS evaluation — wrap in try/except so flow always completes
+        # 1. RAGAS quality evaluation
         try:
             from src.evaluation.ragas_scorer import evaluate_playbook
             ragas_score = evaluate_playbook(playbook, self.state.signal)
             self.state.ragas_score = ragas_score
-            print(
+            logger.info(
                 f"[ragas] overall={ragas_score.overall:.3f} "
                 f"faithfulness={ragas_score.faithfulness:.3f} "
                 f"relevance={ragas_score.answer_relevance:.3f} "
@@ -149,14 +175,33 @@ class DisruptionFlow(Flow[FlowState]):
                 f"passed={'✓' if ragas_score.passed else '✗'}"
             )
         except Exception as exc:
-            print(f"[ragas] evaluation skipped: {exc}")
+            logger.warning(f"[ragas] evaluation skipped: {exc}")
 
-        # Flush Langfuse so all agent spans and RAGAS scores are recorded
+        # 2. DynamoDB persistence — save full FlowState
+        try:
+            from src.persistence.dynamodb import save_playbook_result
+            saved = save_playbook_result(self.state)
+            if not saved:
+                logger.warning(
+                    f"[dynamodb] save returned False for {self.state.signal.signal_id}"
+                )
+        except Exception as exc:
+            logger.error(f"[dynamodb] error: {exc}")
+
+        # 3. SNS notification routing
+        try:
+            from src.notifications.sns_publisher import publish_playbook_alert
+            publish_playbook_alert(playbook, self.state.ragas_score)
+        except Exception as exc:
+            logger.error(f"[sns] error: {exc}")
+
+        # 4. Flush Langfuse so all agent spans and scores are recorded
         try:
             get_tracer().flush()
         except Exception:
             pass
 
+        self.state.completed_at = datetime.now(timezone.utc).isoformat()
         return playbook
 
 

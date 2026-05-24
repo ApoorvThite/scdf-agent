@@ -28,14 +28,14 @@ SCDF is a production-grade multi-agent AI system that continuously monitors glob
 
 ## CrewAI Agents
 
-| Agent | Model | Role |
-|---|---|---|
-| Signal Ingester | gpt-4o-mini | Classifies raw signals, extracts structured metadata, deduplicates |
-| Scenario Builder | gpt-4o-mini | Constructs P10/P50/P90 scenario narratives from signal + historical data |
-| Impact Modeler | gpt-4o-mini | Retrieves similar past disruptions from Qdrant, estimates financial/time impact |
-| Bull Analyst | **gpt-4o** | Argues the optimistic recovery scenario; challenges bear assumptions |
-| Bear Analyst | **gpt-4o** | Argues the pessimistic scenario; identifies tail risks and failure modes |
-| Playbook Writer | gpt-4o-mini | Synthesises debate output into ranked, actionable response playbook |
+| Agent | Model | Status | Role |
+|---|---|---|---|
+| Signal Ingester | gpt-4o-mini | **REAL** (Week 4) | Classifies raw signals via LLM structured output; rule-based fallback |
+| Scenario Builder | gpt-4o-mini | **REAL** (Week 3) | P10/P50/P90 scenarios via Prophet engine |
+| Impact Modeler | gpt-4o-mini | **REAL** (Week 3) | Qdrant RAG retrieval; 3-tier broadening search |
+| Bull Analyst | **gpt-4o** | stub → Week 5 | Optimistic recovery scenario; challenges bear assumptions |
+| Bear Analyst | **gpt-4o** | stub → Week 5 | Pessimistic scenario; identifies tail risks |
+| Playbook Writer | gpt-4o-mini | stub → Week 5 | Synthesises debate into ranked, actionable playbook |
 
 ---
 
@@ -94,10 +94,10 @@ Estimated monthly cost at 100 crew runs/day: **$8–15 total** (dominated by deb
 | 1 | Project scaffold, Qdrant + Langfuse setup, Helicone proxy, mock signals, 60 seed records | ✅ Complete |
 | 2 | Stub CrewAI Flow + all 6 stub agents, Langfuse trace per agent step, fast-path/full-debate routing | ✅ Complete |
 | 3 | Prophet P10/P50/P90 forecasting (scenario_builder), Qdrant RAG retrieval (impact_modeler), RAGAS evaluation layer | ✅ Complete |
-| 4 | Signal Ingester real LLM, Redis Streams consumer, DynamoDB persistence layer | ⬜ Upcoming |
-| 5 | Bull/Bear debate crew with structured argument schema + synthesis | ⬜ Upcoming |
-| 6 | Playbook Writer real LLM + S3 artifact storage | ⬜ Upcoming |
-| 7 | SNS alerts + AWS Lambda scheduling + end-to-end integration test | ⬜ Upcoming |
+| 4 | Real signal ingester LLM, Redis Streams consumer, DynamoDB persistence, SNS routing, Lambda handler | ✅ Complete |
+| 5 | Bull/Bear real gpt-4o debate agents, playbook_writer real LLM synthesis | ⬜ Upcoming |
+| 6 | S3 artifact storage + playbook versioning | ⬜ Upcoming |
+| 7 | Full end-to-end integration + performance tests | ⬜ Upcoming |
 | 8 | React dashboard (Recharts) + Vercel deployment | ⬜ Upcoming |
 
 ---
@@ -172,6 +172,94 @@ Each metric calls `_call_llm()` which sends a zero-shot JSON prompt to gpt-4o-mi
 The flow's `persist_result` step calls `evaluate_playbook()` inside a `try/except` so RAGAS failure never stops a flow run. Results are logged to Langfuse via `score_current_trace`.
 
 The standalone `scripts/evaluate_playbook.py` runner mocks Langfuse and tests 3 signal types (port/8, weather/6, tariff/5), saving JSON results to `data/eval_results/`.
+
+---
+
+## Ingestion Pipeline (Week 4)
+
+```
+[Mock Generator / EventBridge]
+    ↓  publish_signal()
+[Upstash Redis Streams — scdf:signals]
+    ↓  consume_signals() / consume_once()
+[Lambda handler — src/handlers/signal_handler.py]
+    ↓  local_invoke() / handler(event, context)
+[DisruptionFlow.kickoff()]
+    ↓
+[persist_result → DynamoDB + SNS]
+```
+
+- **Redis stream key**: `scdf:signals`
+- **Consumer group**: `scdf-crew`, consumer `worker-1`
+- **XREADGROUP** with `block=5000ms` for the infinite consumer loop; `block=0` for `consume_once`
+- Messages are ACKed only after successful handler return (stay pending for retry on failure)
+- `publish_signal()` and `consume_once()` are available in `src/ingestion/`
+- `scripts/publish_signal.py` is the CLI for manual signal injection
+
+### Lambda Handler (`src/handlers/signal_handler.py`)
+
+Supports two event shapes:
+1. **EventBridge**: `event["detail"]` contains signal fields
+2. **Direct invocation**: event is the signal dict itself (local testing)
+
+`local_invoke(signal)` wraps a DisruptionSignal in a synthetic EventBridge event and calls `handler()` — used by `scripts/run_pipeline.py` and integration tests.
+
+---
+
+## Persistence Layer (Week 4)
+
+### DynamoDB Table: `scdf-disruptions`
+
+| Field | Type | Description |
+|---|---|---|
+| `signal_id` | PK (str) | DisruptionSignal UUID |
+| `created_at` | SK (str) | ISO 8601 UTC timestamp |
+| `region` | str | GSI-1 partition key |
+| `risk_level` | str | GSI-2 partition key |
+| `disruption_type` | str | Disruption category |
+| `signal` | map | Full DisruptionSignal JSON |
+| `playbook` | map | Full Playbook JSON |
+| `signal_analysis` | map | SignalAnalysis (if ran) |
+| `scenario_set` | map | ScenarioSet (if ran) |
+| `impact_analysis` | map | ImpactAnalysis (if ran) |
+| `ragas_score` | map | RAGASScore (if evaluated) |
+
+**GSIs**:
+- `region-created_at-index` — dashboard queries by region
+- `risk_level-created_at-index` — alert dashboard queries by risk
+
+Billing: `PAY_PER_REQUEST` (AWS always-free tier compatible).
+All Python `float` values are converted to `Decimal` before upsert.
+
+`ensure_table_exists()` is called once per process via `startup_check()` in the flow's `ingest_signal` step.
+
+---
+
+## Notification Routing (Week 4)
+
+SNS topics are routed by `playbook.overall_risk`:
+
+| Risk Level | SNS Topic | Behaviour |
+|---|---|---|
+| critical | `sns_topic_critical` | Immediate alert (Slack/pager) |
+| high | `sns_topic_critical` | Same topic as critical |
+| medium | `sns_topic_standard` | Standard alert (email digest) |
+| low | None | No-op (logged only) |
+
+In `ENVIRONMENT=development`, SNS calls are replaced with log output — no real AWS SNS infrastructure required for local development.
+
+Alert message format:
+```json
+{
+  "signal_id": "...",
+  "risk_level": "high",
+  "dominant_scenario": "P10 (worst case)",
+  "top_action": "Activate alternative routing...",
+  "ragas_passed": true,
+  "generated_at": "...",
+  "playbook_summary": "..."
+}
+```
 
 ---
 

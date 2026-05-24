@@ -1,4 +1,4 @@
-.PHONY: install up down setup seed test signal week1 run-crew run-crew-port verify-langfuse week2 forecast-test retrieval-test evaluate week3
+.PHONY: install up down setup seed test signal week1 run-crew run-crew-port verify-langfuse week2 forecast-test retrieval-test evaluate week3 publish-signal publish-port run-pipeline run-pipeline-port setup-aws week4
 
 install:
 	pip install -r requirements.txt
@@ -60,4 +60,28 @@ week3: up
 	$(MAKE) run-crew
 	$(MAKE) verify-langfuse
 	$(MAKE) evaluate
+	$(MAKE) test
+
+publish-signal:
+	python -m scripts.publish_signal
+
+publish-port:
+	python -m scripts.publish_signal --type port --severity 8
+
+run-pipeline:
+	python -m scripts.run_pipeline
+
+run-pipeline-port:
+	python -m scripts.run_pipeline --type port --severity 8
+
+setup-aws:
+	python -m scripts.setup_aws
+
+week4: up
+	@echo "Waiting 15 seconds for services to start..."
+	@sleep 15
+	$(MAKE) setup-aws
+	$(MAKE) seed
+	$(MAKE) run-pipeline
+	$(MAKE) verify-langfuse
 	$(MAKE) test
