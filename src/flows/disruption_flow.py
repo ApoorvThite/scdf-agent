@@ -28,8 +28,8 @@ _startup_done = False
 from crewai.flow.flow import Flow, listen, router, start, or_
 from pydantic import BaseModel, Field
 
-from src.agents.bear_analyst import run as run_bear
-from src.agents.bull_analyst import run as run_bull
+from src.agents.bear_analyst import _bear_fallback, run as run_bear
+from src.agents.bull_analyst import _bull_fallback, run as run_bull
 from src.agents.impact_modeler import run as run_impact_modeler
 from src.agents.playbook_writer import run as run_playbook_writer
 from src.agents.scenario_builder import run as run_scenario_builder
@@ -127,23 +127,52 @@ class DisruptionFlow(Flow[FlowState]):
     @listen(_FULL_DEBATE)
     async def run_debate(self):
         """Run bull and bear analysts in parallel using asyncio.gather."""
-        bull_result, bear_result = await asyncio.gather(
-            asyncio.to_thread(run_bull, self.state.signal),
-            asyncio.to_thread(run_bear, self.state.signal),
+        results = await asyncio.gather(
+            asyncio.to_thread(
+                run_bull,
+                self.state.signal,
+                self.state.scenario_set,
+                self.state.impact_analysis,
+            ),
+            asyncio.to_thread(
+                run_bear,
+                self.state.signal,
+                self.state.scenario_set,
+                self.state.impact_analysis,
+            ),
+            return_exceptions=True,
         )
+        # Unpack, replacing any exceptions with fallback positions
+        bull_result, bear_result = results
+        if isinstance(bull_result, Exception):
+            logger.warning(f"[run_debate] bull analyst raised exception: {bull_result}")
+            bull_result = _bull_fallback(self.state.signal)
+        if isinstance(bear_result, Exception):
+            logger.warning(f"[run_debate] bear analyst raised exception: {bear_result}")
+            bear_result = _bear_fallback(self.state.signal)
         self.state.bull_position = bull_result
         self.state.bear_position = bear_result
 
     @listen(_FAST_PATH)
     def fast_playbook(self):
         """Fast path — skip debate and write playbook directly from P50 scenario."""
-        self.state.playbook = run_playbook_writer(self.state.signal)
+        self.state.playbook = run_playbook_writer(
+            self.state.signal,
+            self.state.scenario_set,
+            self.state.impact_analysis,
+        )
         self.state.completed_at = datetime.now(timezone.utc).isoformat()
 
     @listen(run_debate)
     def write_playbook(self):
         """Synthesise debate outputs into the final ranked playbook."""
-        self.state.playbook = run_playbook_writer(self.state.signal)
+        self.state.playbook = run_playbook_writer(
+            self.state.signal,
+            self.state.scenario_set,
+            self.state.impact_analysis,
+            self.state.bull_position,
+            self.state.bear_position,
+        )
         self.state.completed_at = datetime.now(timezone.utc).isoformat()
 
     @listen(write_playbook)
